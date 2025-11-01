@@ -2,6 +2,11 @@
 
 InterviewPrep is an AI-powered mock interview coach built with Next.js, Mantine, and Tailwind CSS. Pair up with a real-time interviewing agent, practice curated technical and behavioral sessions, and receive structured, data-backed feedback so you can level up before your next real interview.
 
+## 🖼️ Preview
+<div align="center">
+  <img src="./public/readme/hero-preview.png" alt="InterviewPrep hero section with AI interviewer robot" width="100%" />
+</div>
+
 ## ✨ Features
 - **AI Voice Interviewer** – conduct live interview sessions powered by Vapi voice workflows and Google Gemini evaluations.
 - **Dynamic Interview Library** – browse available practice sessions or revisit historical interviews tailored to your stack.
