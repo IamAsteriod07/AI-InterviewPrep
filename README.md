@@ -1,4 +1,5 @@
-![InterviewPrep hero preview](./public/Screenshot%202025-06-17%20072826.png)
+
+![InterviewPrep Hero](./public/Screenshot%202025-06-17%20072826%20(1).png)
 
 # 🎤 InterviewPrep
 
