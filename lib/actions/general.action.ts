@@ -9,12 +9,14 @@ import { feedbackSchema } from "@/constants";
 export async function createFeedback(params: CreateFeedbackParams) {
   const { interviewId, userId, transcript, feedbackId } = params;
 
-  try {
-    if (!db) {
-      console.error("Firebase Admin not initialized. Unable to create feedback.");
-      return { success: false };
-    }
+  const firestore = db;
 
+  if (!firestore) {
+    console.error("Firestore has not been initialized.");
+    return { success: false };
+  }
+
+  try {
     const formattedTranscript = transcript
       .map(
         (sentence: { role: string; content: string }) =>
@@ -54,13 +56,11 @@ export async function createFeedback(params: CreateFeedbackParams) {
       createdAt: new Date().toISOString(),
     };
 
-    let feedbackRef;
+    const feedbackCollection = firestore.collection("feedback");
 
-    if (feedbackId) {
-      feedbackRef = db.collection("feedback").doc(feedbackId);
-    } else {
-      feedbackRef = db.collection("feedback").doc();
-    }
+    const feedbackRef = feedbackId
+      ? feedbackCollection.doc(feedbackId)
+      : feedbackCollection.doc();
 
     await feedbackRef.set(feedback);
 
@@ -78,13 +78,15 @@ export async function getInterviewById(id: string): Promise<Interview | null> {
     return null;
   }
 
-  try {
-    if (!db) {
-      console.error("Firebase Admin not initialized. Unable to fetch interview.");
-      return null;
-    }
+  const firestore = db;
 
-    const interview = await db.collection("interviews").doc(id).get();
+  if (!firestore) {
+    console.error("Firestore has not been initialized.");
+    return null;
+  }
+
+  try {
+    const interview = await firestore.collection("interviews").doc(id).get();
 
     if (!interview.exists) {
       return null;
@@ -102,22 +104,14 @@ export async function getFeedbackByInterviewId(
 ): Promise<Feedback | null> {
   const { interviewId, userId } = params;
 
-  if (!db) {
-    console.error("Firebase Admin not initialized. Unable to fetch feedback.");
+  const firestore = db;
+
+  if (!firestore) {
+    console.error("Firestore has not been initialized.");
     return null;
   }
 
-  if (!interviewId || typeof interviewId !== "string" || interviewId.trim() === "") {
-    console.error("Invalid interview ID provided for feedback lookup.");
-    return null;
-  }
-
-  if (!userId || typeof userId !== "string" || userId.trim() === "") {
-    console.error("Invalid user ID provided for feedback lookup.");
-    return null;
-  }
-
-  const querySnapshot = await db
+  const querySnapshot = await firestore
     .collection("feedback")
     .where("interviewId", "==", interviewId)
     .where("userId", "==", userId)
@@ -135,17 +129,14 @@ export async function getLatestInterviews(
 ): Promise<Interview[] | null> {
   const { userId, limit = 20 } = params;
 
-  if (!db) {
-    console.error("Firebase Admin not initialized. Unable to fetch latest interviews.");
+  const firestore = db;
+
+  if (!firestore) {
+    console.error("Firestore has not been initialized.");
     return null;
   }
 
-  if (!userId || typeof userId !== "string" || userId.trim() === "") {
-    console.error("Invalid user ID provided for latest interviews lookup.");
-    return null;
-  }
-
-  const interviews = await db
+  const interviews = await firestore
     .collection("interviews")
     .orderBy("createdAt", "desc")
     .where("finalized", "==", true)
@@ -162,17 +153,14 @@ export async function getLatestInterviews(
 export async function getInterviewsByUserId(
   userId: string
 ): Promise<Interview[] | null> {
-  if (!db) {
-    console.error("Firebase Admin not initialized. Unable to fetch interviews by user.");
+  const firestore = db;
+
+  if (!firestore) {
+    console.error("Firestore has not been initialized.");
     return null;
   }
 
-  if (!userId || typeof userId !== "string" || userId.trim() === "") {
-    console.error("Invalid user ID provided for user interview lookup.");
-    return null;
-  }
-
-  const interviews = await db
+  const interviews = await firestore
     .collection("interviews")
     .where("userId", "==", userId)
     .orderBy("createdAt", "desc")

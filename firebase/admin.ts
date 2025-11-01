@@ -10,6 +10,9 @@ import {
 import { getAuth } from "firebase-admin/auth";
 import { getFirestore } from "firebase-admin/firestore";
 
+import { firebaseProjectId } from "./config";
+import bundledServiceAccount from "./service-account.json";
+
 type ServiceAccountConfig = {
   projectId: string;
   clientEmail: string;
@@ -29,19 +32,73 @@ declare global {
 const normalizePrivateKey = (value: string | undefined | null) => {
   if (!value) return null;
 
-  const trimmed = value.trim();
+  const cleaned = value
+    .trim()
+    .replace(/\r\n?/g, "\n")
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\n");
 
-  if (!trimmed.length) return null;
+  if (!cleaned.length) {
+    return null;
+  }
 
-  return trimmed.includes("\\n") ? trimmed.replace(/\\n/g, "\n") : trimmed;
+  const ensureTrailingNewline = (input: string) =>
+    input.endsWith("\n") ? input : `${input}\n`;
+
+  const headerRegex = /-----BEGIN ([A-Z0-9 ]+)-----/;
+  const footerRegex = /-----END ([A-Z0-9 ]+)-----/;
+
+  const headerMatch = cleaned.match(headerRegex);
+  const footerMatch = cleaned.match(footerRegex);
+
+  if (headerMatch && footerMatch) {
+    return ensureTrailingNewline(cleaned.replace(/\r\n?/g, "\n"));
+  }
+
+  const identifier = headerMatch?.[1] ?? footerMatch?.[1] ?? "PRIVATE KEY";
+  const sanitized = cleaned.replace(/[^A-Za-z0-9+/=]/g, "");
+
+  if (!sanitized.length) {
+    return null;
+  }
+
+  const padding = sanitized.length % 4;
+  const padded = padding ? sanitized.padEnd(sanitized.length + (4 - padding), "=") : sanitized;
+
+  let buffer: Buffer;
+
+  try {
+    buffer = Buffer.from(padded, "base64");
+  } catch (error) {
+    console.warn("Unable to decode Firebase service account private key.", error);
+    return null;
+  }
+
+  if (!buffer.length) {
+    return null;
+  }
+
+  const base64Body = buffer.toString("base64");
+  const chunkedBody = base64Body.match(/.{1,64}/g)?.join("\n");
+
+  if (!chunkedBody) {
+    return null;
+  }
+
+  const header = `-----BEGIN ${identifier}-----`;
+  const footer = `-----END ${identifier}-----`;
+
+  return ensureTrailingNewline(`${header}\n${chunkedBody}\n${footer}`);
 };
 
 const readServiceAccountFromFile = () => {
+  const cwd = process.cwd();
   const candidates = [
     process.env.FIREBASE_SERVICE_ACCOUNT_PATH,
     process.env.GOOGLE_APPLICATION_CREDENTIALS,
-    join(process.cwd(), "firebase", "service-account.json"),
-    join(process.cwd(), "service-account.json"),
+    join(cwd, "firebase", "service-account.json"),
+    join(cwd, "service-account.json"),
   ].filter(Boolean) as string[];
 
   for (const filePath of candidates) {
@@ -129,6 +186,15 @@ const loadServiceAccount = (): ServiceAccountConfig | null => {
     }
   }
 
+  if (
+    process.env.NODE_ENV !== "production" &&
+    bundledServiceAccount &&
+    typeof bundledServiceAccount === "object" &&
+    Object.keys(bundledServiceAccount as Record<string, unknown>).length
+  ) {
+    sources.push(bundledServiceAccount as Record<string, unknown>);
+  }
+
   for (const source of sources) {
     try {
       const payload =
@@ -159,30 +225,41 @@ const initFirebaseAdmin = (): FirebaseAdminServices | null => {
 
     try {
       if (serviceAccount) {
+        const privateKey = serviceAccount.privateKey;
+
         initializeApp({
           credential: cert({
             projectId: serviceAccount.projectId,
             clientEmail: serviceAccount.clientEmail,
-            privateKey: serviceAccount.privateKey,
+            privateKey,
           }),
           projectId: serviceAccount.projectId,
         });
       } else {
-          const adc = getApplicationDefaultCredential();
+        const adc = getApplicationDefaultCredential();
 
-          if (adc) {
-            initializeApp({
-              credential: adc,
-              projectId: usingEmulator ? projectId ?? "demo-project" : projectId ?? undefined,
-            });
-          } else if (usingEmulator) {
+        if (adc) {
+          initializeApp({
+            credential: adc,
+            projectId: usingEmulator ? projectId ?? "demo-project" : projectId ?? undefined,
+          });
+        } else if (usingEmulator) {
           initializeApp({
             projectId: projectId ?? "demo-project",
           });
         } else {
-          throw new Error(
-            "Firebase Admin credentials are missing. Provide FIREBASE_SERVICE_ACCOUNT_KEY, FIREBASE_SERVICE_ACCOUNT_PATH, or the FIREBASE_PROJECT_ID/FIREBASE_CLIENT_EMAIL/FIREBASE_PRIVATE_KEY trio."
-          );
+          if (process.env.NODE_ENV !== "production") {
+            console.warn(
+              "Firebase Admin credentials are missing. Falling back to limited local initialization. Sessions will not persist across restarts."
+            );
+            initializeApp({
+              projectId: projectId ?? "demo-project",
+            });
+          } else {
+            throw new Error(
+              "Firebase Admin credentials are missing. Provide FIREBASE_SERVICE_ACCOUNT_KEY, FIREBASE_SERVICE_ACCOUNT_PATH, or the FIREBASE_PROJECT_ID/FIREBASE_CLIENT_EMAIL/FIREBASE_PRIVATE_KEY trio."
+            );
+          }
         }
       }
     } catch (error) {
@@ -213,6 +290,7 @@ function resolveProjectId(fromServiceAccount?: string): string | null {
     process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
     process.env.GCLOUD_PROJECT,
     process.env.GOOGLE_CLOUD_PROJECT,
+    firebaseProjectId,
   ];
 
   for (const candidate of candidates) {
@@ -239,6 +317,15 @@ function shouldUseEmulator(): boolean {
 }
 
 function getApplicationDefaultCredential() {
+  if (!hasApplicationDefaultCredentialSupport()) {
+    if (process.env.NODE_ENV !== "production") {
+      console.warn(
+        "Application default credentials are not configured. Provide GOOGLE_APPLICATION_CREDENTIALS or a Firebase service account."
+      );
+    }
+    return null;
+  }
+
   try {
     return applicationDefault();
   } catch (error) {
@@ -247,4 +334,26 @@ function getApplicationDefaultCredential() {
     }
     return null;
   }
+}
+
+function hasApplicationDefaultCredentialSupport(): boolean {
+  const gcpRuntimeIndicators = [
+    process.env.K_SERVICE,
+    process.env.FUNCTION_TARGET,
+    process.env.GAE_SERVICE,
+    process.env.CLOUD_RUN_JOB,
+    process.env.GCE_INSTANCE,
+  ];
+
+  const configuredCredentials = [
+    process.env.GOOGLE_APPLICATION_CREDENTIALS,
+    process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON,
+    process.env.GOOGLE_AUTH_CREDENTIALS,
+    process.env.GOOGLE_AUTH_CLIENT_EMAIL,
+  ];
+
+  return (
+    gcpRuntimeIndicators.some((value) => typeof value === "string" && value.trim().length > 0) ||
+    configuredCredentials.some((value) => typeof value === "string" && value.trim().length > 0)
+  );
 }

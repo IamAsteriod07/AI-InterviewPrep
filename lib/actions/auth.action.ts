@@ -1,29 +1,32 @@
 "use server";
 
-import "server-only";
-
 import { auth, db } from "@/firebase/admin";
 import { cookies } from "next/headers";
 
 const ONE_WEEK = 60 * 60 * 24 * 7;
 
+function ensureAuth(): NonNullable<typeof auth> {
+  if (!auth) {
+    throw new Error("Firebase Auth instance is not initialized.");
+  }
+
+  return auth;
+}
+
+function ensureDb(): NonNullable<typeof db> {
+  if (!db) {
+    throw new Error("Firestore instance is not initialized.");
+  }
+
+  return db;
+}
+
 export async function signUp(params: SignUpParams) {
   const { uid, name, email } = params;
 
   try {
-    if (!db) {
-      throw new Error("Firestore is not initialized");
-    }
-
-    if (!uid || typeof uid !== "string" || uid.trim() === "") {
-      throw new Error("A valid uid must be provided to sign up");
-    }
-
-    if (!email || typeof email !== "string" || email.trim() === "") {
-      throw new Error("A valid email must be provided to sign up");
-    }
-
-    const userRecord = await db.collection("users").doc(uid).get();
+    const firestore = ensureDb();
+    const userRecord = await firestore.collection("users").doc(uid).get();
     if (userRecord.exists) {
       return {
         success: false,
@@ -31,7 +34,7 @@ export async function signUp(params: SignUpParams) {
       };
     }
 
-    await db.collection("users").doc(uid).set({
+    await firestore.collection("users").doc(uid).set({
       name,
       email,
     });
@@ -40,28 +43,15 @@ export async function signUp(params: SignUpParams) {
       success: true,
       message: "Account created successfully. Please Sign in.",
     };
-  } catch (error: unknown) {
-    console.error("Error creating a user", error);
+  } catch (e: any) {
+    console.error("Error creating a user", e);
 
-    if (typeof error === "object" && error) {
-      const { code, message } = error as { code?: string; message?: string };
-
-      if (code === "auth/email-already-exists") {
-        return {
-          success: false,
-          message: "This email is already in use.",
-        };
-      }
-
-      if (message && message.includes("Project Id")) {
-        return {
-          success: false,
-          message:
-            "Firebase project ID is missing. Configure FIREBASE_PROJECT_ID or provide service account credentials.",
-        };
-      }
+    if (e.code === "auth/email-already-exists") {
+      return {
+        success: false,
+        message: "This email is already in use.",
+      };
     }
-
     return {
       success: false,
       message: "Failed to create an account",
@@ -72,30 +62,9 @@ export async function signUp(params: SignUpParams) {
 export async function signIn(params: SignInParams) {
   const { email, idToken } = params;
 
-  if (!auth) {
-    return {
-      success: false,
-      message:
-        "Firebase Auth is not initialized. Configure FIREBASE_PROJECT_ID or provide service account credentials.",
-    };
-  }
-
-  if (!email || typeof email !== "string" || email.trim() === "") {
-    return {
-      success: false,
-      message: "A valid email must be provided to sign in.",
-    };
-  }
-
-  if (!idToken || typeof idToken !== "string" || idToken.trim() === "") {
-    return {
-      success: false,
-      message: "Missing ID token. Please try signing in again.",
-    };
-  }
-
   try {
-    const userRecord = await auth.getUserByEmail(email);
+    const adminAuth = ensureAuth();
+    const userRecord = await adminAuth.getUserByEmail(email);
     if (!userRecord) {
       return {
         success: false,
@@ -104,41 +73,22 @@ export async function signIn(params: SignInParams) {
     }
 
     await setSessionCookie(idToken);
-
-    return {
-      success: true,
-      message: "Signed in successfully.",
-    };
-  } catch (error) {
-    console.error("Error signing in user", error);
-
-    if (typeof error === "object" && error) {
-      const { message } = error as { message?: string };
-
-      if (message && message.includes("Project Id")) {
-        return {
-          success: false,
-          message:
-            "Firebase project ID is missing. Configure FIREBASE_PROJECT_ID or provide service account credentials.",
-        };
-      }
-    }
-
-    return {
-      success: false,
-      message: "Failed to log into an account",
-    };
+  } catch (e) {
+    console.log(e);
   }
+
+  return {
+    success: false,
+    message: "Failed to log into an account",
+  };
 }
 
 export async function setSessionCookie(idToken: string) {
   const cookieStore = await cookies();
 
-  if (!auth) {
-    throw new Error("Firebase Auth is not initialized");
-  }
+  const adminAuth = ensureAuth();
 
-  const sessionCookie = await auth.createSessionCookie(idToken, {
+  const sessionCookie = await adminAuth.createSessionCookie(idToken, {
     expiresIn: ONE_WEEK * 1000, // 7 days
   });
 
@@ -158,13 +108,11 @@ export async function getCurrentUser(): Promise<User | null> {
 
   if (!sessionCookie) return null;
   try {
-    if (!auth || !db) {
-      return null;
-    }
+    const adminAuth = ensureAuth();
+    const decodedClaims = await adminAuth.verifySessionCookie(sessionCookie, true);
 
-    const decodedClaims = await auth.verifySessionCookie(sessionCookie, true);
-
-    const userRecord = await db
+    const firestore = ensureDb();
+    const userRecord = await firestore
       .collection("users")
       .doc(decodedClaims.uid)
       .get();
@@ -187,4 +135,6 @@ export async function isAuthenticated() {
 
   return !!user;
 }
+
+
 
