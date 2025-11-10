@@ -1,3 +1,4 @@
+import { createPrivateKey } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -32,44 +33,84 @@ declare global {
 const normalizePrivateKey = (value: string | undefined | null) => {
   if (!value) return null;
 
-  const cleaned = value
-    .trim()
-    .replace(/\r\n?/g, "\n")
-    .replace(/\\r\\n/g, "\n")
-    .replace(/\\n/g, "\n")
-    .replace(/\\r/g, "\n");
-
-  if (!cleaned.length) {
-    return null;
-  }
+  const stripWrappingQuotes = (input: string) => {
+    const wrappers = ["'", '"', "`"];
+    for (const quote of wrappers) {
+      if (input.startsWith(quote) && input.endsWith(quote)) {
+        return input.slice(1, -1);
+      }
+    }
+    return input;
+  };
 
   const ensureTrailingNewline = (input: string) =>
     input.endsWith("\n") ? input : `${input}\n`;
 
-  const headerRegex = /-----BEGIN ([A-Z0-9 ]+)-----/;
-  const footerRegex = /-----END ([A-Z0-9 ]+)-----/;
+  const normalizeEscapes = (input: string) =>
+    input
+      .replace(/\\r\\n/g, "\n")
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "\n")
+      .replace(/\r\n?/g, "\n")
+      .replace(/\\"/g, '"');
 
-  const headerMatch = cleaned.match(headerRegex);
-  const footerMatch = cleaned.match(footerRegex);
+  const stripped = stripWrappingQuotes(value.trim());
 
-  if (headerMatch && footerMatch) {
-    return ensureTrailingNewline(cleaned.replace(/\r\n?/g, "\n"));
-  }
-
-  const identifier = headerMatch?.[1] ?? footerMatch?.[1] ?? "PRIVATE KEY";
-  const sanitized = cleaned.replace(/[^A-Za-z0-9+/=]/g, "");
-
-  if (!sanitized.length) {
+  if (!stripped.length) {
     return null;
   }
 
-  const padding = sanitized.length % 4;
-  const padded = padding ? sanitized.padEnd(sanitized.length + (4 - padding), "=") : sanitized;
+  const normalized = normalizeEscapes(stripped).trim();
+
+  if (!normalized.length) {
+    return null;
+  }
+
+  if (normalized.startsWith("{") && normalized.endsWith("}")) {
+    try {
+      const parsed = JSON.parse(normalized) as Record<string, unknown>;
+      const nestedKey =
+        (parsed.private_key as string | undefined) ??
+        (parsed.privateKey as string | undefined);
+
+      if (typeof nestedKey === "string" && nestedKey.trim().length) {
+        return normalizePrivateKey(nestedKey);
+      }
+    } catch (error) {
+      console.warn(
+        "Firebase private key payload is JSON but missing a private_key field.",
+        error
+      );
+      return null;
+    }
+  }
+
+  if (normalized.includes("-----BEGIN") && normalized.includes("-----END")) {
+    const lines = normalized
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    const rebuilt = lines.join("\n");
+    const pem = ensureTrailingNewline(rebuilt);
+
+    if (!isParsablePrivateKey(pem)) {
+      return null;
+    }
+
+    return pem;
+  }
+
+  const sanitizedBase64 = normalized.replace(/[^A-Za-z0-9+/=]/g, "");
+
+  if (!sanitizedBase64.length) {
+    return null;
+  }
 
   let buffer: Buffer;
 
   try {
-    buffer = Buffer.from(padded, "base64");
+    buffer = Buffer.from(sanitizedBase64, "base64");
   } catch (error) {
     console.warn("Unable to decode Firebase service account private key.", error);
     return null;
@@ -79,17 +120,67 @@ const normalizePrivateKey = (value: string | undefined | null) => {
     return null;
   }
 
-  const base64Body = buffer.toString("base64");
-  const chunkedBody = base64Body.match(/.{1,64}/g)?.join("\n");
-
-  if (!chunkedBody) {
+  if (buffer.length < 128) {
+    console.warn(
+      "Firebase service account private key appears truncated or invalid."
+    );
     return null;
   }
 
-  const header = `-----BEGIN ${identifier}-----`;
-  const footer = `-----END ${identifier}-----`;
+  const base64Body = buffer.toString("base64");
+  const chunked = base64Body.match(/.{1,64}/g)?.join("\n");
 
-  return ensureTrailingNewline(`${header}\n${chunkedBody}\n${footer}`);
+  if (!chunked) {
+    return null;
+  }
+
+  const pem = `-----BEGIN PRIVATE KEY-----\n${chunked}\n-----END PRIVATE KEY-----\n`;
+
+  if (!isParsablePrivateKey(pem)) {
+    return null;
+  }
+
+  return pem;
+};
+
+const extractPemBody = (pem: string) => {
+  const match = pem.match(/-----BEGIN ([A-Z0-9 ]+)-----([\s\S]+?)-----END \1-----/);
+  if (!match) {
+    return null;
+  }
+
+  const [, , body] = match;
+  const sanitized = body.replace(/\s+/g, "");
+
+  return sanitized.length ? sanitized : null;
+};
+
+const isParsablePrivateKey = (pem: string) => {
+  try {
+    createPrivateKey({ key: pem, format: "pem" });
+    return true;
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+
+    if (err?.code === "ERR_OSSL_UNSUPPORTED") {
+      const body = extractPemBody(pem);
+
+      if (!body) {
+        return false;
+      }
+
+      try {
+        const decoded = Buffer.from(body, "base64");
+        return decoded.length >= 128;
+      } catch (decodeError) {
+        console.warn("Firebase private key failed base64 validation.", decodeError);
+        return false;
+      }
+    }
+
+    console.warn("Firebase private key is not a valid PEM.", error);
+    return false;
+  }
 };
 
 const readServiceAccountFromFile = () => {
@@ -219,53 +310,7 @@ const initFirebaseAdmin = (): FirebaseAdminServices | null => {
   }
 
   if (!getApps().length) {
-    const serviceAccount = loadServiceAccount();
-    const projectId = resolveProjectId(serviceAccount?.projectId);
-    const usingEmulator = shouldUseEmulator();
-
-    try {
-      if (serviceAccount) {
-        const privateKey = serviceAccount.privateKey;
-
-        initializeApp({
-          credential: cert({
-            projectId: serviceAccount.projectId,
-            clientEmail: serviceAccount.clientEmail,
-            privateKey,
-          }),
-          projectId: serviceAccount.projectId,
-        });
-      } else {
-        const adc = getApplicationDefaultCredential();
-
-        if (adc) {
-          initializeApp({
-            credential: adc,
-            projectId: usingEmulator ? projectId ?? "demo-project" : projectId ?? undefined,
-          });
-        } else if (usingEmulator) {
-          initializeApp({
-            projectId: projectId ?? "demo-project",
-          });
-        } else {
-          if (process.env.NODE_ENV !== "production") {
-            console.warn(
-              "Firebase Admin credentials are missing. Falling back to limited local initialization. Sessions will not persist across restarts."
-            );
-            initializeApp({
-              projectId: projectId ?? "demo-project",
-            });
-          } else {
-            throw new Error(
-              "Firebase Admin credentials are missing. Provide FIREBASE_SERVICE_ACCOUNT_KEY, FIREBASE_SERVICE_ACCOUNT_PATH, or the FIREBASE_PROJECT_ID/FIREBASE_CLIENT_EMAIL/FIREBASE_PRIVATE_KEY trio."
-            );
-          }
-        }
-      }
-    } catch (error) {
-      console.error("Failed to initialize Firebase Admin SDK", error);
-      return null;
-    }
+    return null;
   }
 
   const services: FirebaseAdminServices = {
